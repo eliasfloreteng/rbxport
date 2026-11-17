@@ -507,7 +507,7 @@ pub(crate) fn checked_under(root: &Path, relative: &str) -> Result<PathBuf> {
         return Err(ExportError::Conflict("Invalid device-relative path".into()));
     }
     let path = root.join(relative);
-    if path.exists() && !path.canonicalize()?.starts_with(root.canonicalize()?) {
+    if path.exists() && !incremental::real_path(&path)?.starts_with(incremental::real_path(root)?) {
         return Err(ExportError::Conflict("A device file points outside the USB".into()));
     }
     Ok(path)
@@ -530,7 +530,7 @@ pub(crate) fn path_key(path: &str) -> String {
 /// such a component is copied under `Contents/` like any other, as there.
 fn on_stick(destination: &Path, source: &Path) -> Option<String> {
     use unicode_normalization::UnicodeNormalization;
-    let root = destination.canonicalize().ok()?;
+    let root = incremental::real_path(destination).ok()?;
     let file = source.canonicalize().ok().filter(|f| f.is_file())?;
     let relative = file.strip_prefix(&root).ok()?;
     let mut parts = Vec::new();

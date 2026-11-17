@@ -59,11 +59,43 @@ fn in_parallel<T: Sync>(items: &[T], each: impl Fn(&T) -> std::io::Result<()> + 
     failed.into_inner().ok().flatten().map_or(Ok(()), Err)
 }
 
-/// [`sync_dir`] for each directory once, several at a time.
+/// [`sync_dir`] for each directory once: each is handed to the device
+/// several at a time, then one drive-cache flush makes them all durable
+/// (see [`hand_over`]).
 pub fn sync_dirs<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> std::io::Result<()> {
     let dirs: std::collections::BTreeSet<&Path> = dirs.into_iter().collect();
     let dirs: Vec<&Path> = dirs.into_iter().collect();
-    in_parallel(&dirs, |dir| sync_dir(dir))
+    in_parallel(&dirs, |dir| hand_over_dir(dir))?;
+    dirs.first().map_or(Ok(()), |dir| sync_dir(dir))
+}
+
+/// Hands a file's data and metadata to the device (`fsync`), without the
+/// drive-cache flush [`flush`] adds. It is durable once a [`flush`] of any
+/// file or directory on the same device has followed: on Apple systems
+/// `F_FULLFSYNC` asks the drive to write out its whole cache, not only that
+/// file's blocks, which SQLite relies on in the same way. A batch of files
+/// therefore costs one cache flush rather than one each, which on a USB
+/// stick is most of what publishing a first export takes. Elsewhere `fsync`
+/// is already the full flush.
+pub fn hand_over(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    return rustix::fs::fsync(file).map_err(std::io::Error::from);
+    #[cfg(not(target_vendor = "apple"))]
+    return flush(file);
+}
+
+/// [`hand_over`] for a directory's entries, skipped where the filesystem
+/// cannot flush a directory at all, as [`sync_dir`] is.
+fn hand_over_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Err(error) = hand_over(&std::fs::File::open(path)?) {
+        if !unsupported(&error) {
+            return Err(error);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// [`create_dir_all`], leaving the flushes it owes to the caller: every
@@ -610,13 +642,18 @@ impl Publication {
             }
         }
         // Every image and every directory holding one is on the device
-        // before the record that names them is: one flush each, several at
-        // a time, all finished before the record is written.
+        // before the record that names them is: each handed over, several
+        // at a time, then made durable by the directories' cache flush, and
+        // again by the record's own, all before the journal is renamed in.
+        // Opened only to read on Unix, where a flush needs no more and a
+        // user-space USB driver answers that open several times faster
+        // than one to write; Windows flushes only a handle it can write.
         in_parallel(&images, |image| {
             std::fs::OpenOptions::new()
-                .write(true)
+                .read(cfg!(unix))
+                .write(!cfg!(unix))
                 .open(image)
-                .and_then(|file| flush(&file))
+                .and_then(|file| hand_over(&file))
                 .map_err(at("flush", image))
         })?;
         sync_dirs(directories.iter().map(PathBuf::as_path))?;

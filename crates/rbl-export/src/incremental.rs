@@ -22,21 +22,65 @@ pub struct Metrics {
     pub probes: u64,
 }
 
+type Revisions = std::collections::HashMap<PathBuf, Option<FileRevision>>;
+type Folders = std::collections::HashMap<PathBuf, PathBuf>;
+
 thread_local! {
     static METRICS: std::cell::RefCell<Metrics> = std::cell::RefCell::new(Metrics::default());
-    static REVISIONS: std::cell::RefCell<Option<std::collections::HashMap<PathBuf, Option<FileRevision>>>> = const { std::cell::RefCell::new(None) };
+    static REVISIONS: std::cell::RefCell<Option<Revisions>> = const { std::cell::RefCell::new(None) };
+    static FOLDERS: std::cell::RefCell<Option<Folders>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct Inspection(Option<std::collections::HashMap<PathBuf, Option<FileRevision>>>);
+pub(crate) struct Inspection(Option<Revisions>, Option<Folders>);
 impl Inspection {
     pub fn new() -> Self {
-        Self(REVISIONS.with(|r| r.replace(Some(std::collections::HashMap::new()))))
+        Self(
+            REVISIONS.with(|r| r.replace(Some(std::collections::HashMap::new()))),
+            FOLDERS.with(|r| r.replace(Some(std::collections::HashMap::new()))),
+        )
     }
 }
 impl Drop for Inspection {
-    fn drop(&mut self) { REVISIONS.with(|r| { r.replace(self.0.take()); }); }
+    fn drop(&mut self) {
+        REVISIONS.with(|r| { r.replace(self.0.take()); });
+        FOLDERS.with(|r| { r.replace(self.1.take()); });
+    }
 }
-pub(crate) fn recheck() { REVISIONS.with(|r| { if let Some(map) = &mut *r.borrow_mut() { map.clear(); } }); }
+pub(crate) fn recheck() {
+    REVISIONS.with(|r| { if let Some(map) = &mut *r.borrow_mut() { map.clear(); } });
+    FOLDERS.with(|r| { if let Some(map) = &mut *r.borrow_mut() { map.clear(); } });
+}
+
+/// Where `path`, which exists, really is: [`std::fs::canonicalize`], with
+/// each folder's answer kept for the inspection.
+///
+/// An export checks that every file it names on the stick resolves inside
+/// it. Each canonicalization asks the filesystem about every component, and
+/// on a USB stick (a user-space driver on iOS and macOS) that is a round
+/// trip apiece, a `statfs` among them: checking a 1,000-track stick twice
+/// was some 100,000 of them. Instead, a name that is not a symbolic link
+/// resolves to its folder's real path and itself, and each folder's answer
+/// is kept: a path costs one `lstat`, and only a link or the top of the
+/// tree is canonicalized. Names are kept as given, not as the disk spells
+/// them: this is for asking where a file is, not whether two names are the
+/// same file.
+pub(crate) fn real_path(path: &Path) -> std::io::Result<PathBuf> {
+    if FOLDERS.with(|f| f.borrow().is_none()) {
+        return std::fs::canonicalize(path);
+    }
+    if let Some(real) = FOLDERS.with(|f| f.borrow().as_ref().and_then(|map| map.get(path).cloned())) {
+        return Ok(real);
+    }
+    let meta = std::fs::symlink_metadata(path)?;
+    let real = match (path.parent().filter(|p| !p.as_os_str().is_empty()), path.file_name()) {
+        (Some(parent), Some(name)) if !meta.file_type().is_symlink() => real_path(parent)?.join(name),
+        _ => std::fs::canonicalize(path)?,
+    };
+    if meta.is_dir() {
+        FOLDERS.with(|f| { if let Some(map) = &mut *f.borrow_mut() { map.insert(path.to_owned(), real.clone()); } });
+    }
+    Ok(real)
+}
 
 pub fn reset_metrics() { METRICS.with(|m| *m.borrow_mut() = Metrics::default()); }
 pub fn metrics() -> Metrics { METRICS.with(|m| m.borrow().clone()) }
@@ -280,4 +324,39 @@ pub fn load_analysis(track: &SourceTrack) -> Result<Vec<(String, Vec<u8>)>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn real_path_agrees_with_canonicalize_and_follows_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("stick");
+        std::fs::create_dir_all(root.join("PIONEER/USBANLZ/P001")).unwrap();
+        std::fs::write(root.join("PIONEER/USBANLZ/P001/ANLZ0000.DAT"), b"x").unwrap();
+        std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+        std::fs::write(dir.path().join("elsewhere/ANLZ0000.DAT"), b"y").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("PIONEER/USBANLZ/P002")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere/ANLZ0000.DAT"), root.join("PIONEER/USBANLZ/P001/ANLZ0000.EXT")).unwrap();
+
+        let _inspection = Inspection::new();
+        for path in [
+            root.clone(),
+            root.join("PIONEER/USBANLZ/P001"),
+            root.join("PIONEER/USBANLZ/P001/ANLZ0000.DAT"),
+            root.join("PIONEER/USBANLZ/P001/ANLZ0000.EXT"),
+            root.join("PIONEER/USBANLZ/P002/ANLZ0000.DAT"),
+        ] {
+            // Twice: the second answer comes from the folders kept.
+            assert_eq!(real_path(&path).unwrap(), std::fs::canonicalize(&path).unwrap(), "{}", path.display());
+            assert_eq!(real_path(&path).unwrap(), std::fs::canonicalize(&path).unwrap(), "{}", path.display());
+        }
+        let real_root = real_path(&root).unwrap();
+        assert!(!real_path(&root.join("PIONEER/USBANLZ/P002/ANLZ0000.DAT")).unwrap().starts_with(&real_root));
+        assert!(!real_path(&root.join("PIONEER/USBANLZ/P001/ANLZ0000.EXT")).unwrap().starts_with(&real_root));
+        assert!(real_path(&root.join("missing")).is_err());
+    }
 }
