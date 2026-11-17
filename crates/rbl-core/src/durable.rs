@@ -27,6 +27,58 @@ pub fn sync_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Runs `each` over `items` on a few threads, returning the first error.
+///
+/// A device flush mostly waits on the device; several in flight at once
+/// overlap that wait where the driver queues them (USB mass storage, `NVMe`),
+/// and cost no more than one after another where it does not.
+fn in_parallel<T: Sync>(items: &[T], each: impl Fn(&T) -> std::io::Result<()> + Sync) -> std::io::Result<()> {
+    const THREADS: usize = 8;
+    if items.len() < 2 {
+        return items.iter().try_for_each(each);
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = std::sync::Mutex::new(None::<std::io::Error>);
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS.min(items.len()) {
+            scope.spawn(|| loop {
+                if failed.lock().map_or(true, |f| f.is_some()) {
+                    return;
+                }
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(item) = items.get(index) else { return };
+                if let Err(error) = each(item) {
+                    if let Ok(mut failed) = failed.lock() {
+                        failed.get_or_insert(error);
+                    }
+                    return;
+                }
+            });
+        }
+    });
+    failed.into_inner().ok().flatten().map_or(Ok(()), Err)
+}
+
+/// [`sync_dir`] for each directory once, several at a time.
+pub fn sync_dirs<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> std::io::Result<()> {
+    let dirs: std::collections::BTreeSet<&Path> = dirs.into_iter().collect();
+    let dirs: Vec<&Path> = dirs.into_iter().collect();
+    in_parallel(&dirs, |dir| sync_dir(dir))
+}
+
+/// [`create_dir_all`], leaving the flushes it owes to the caller: every
+/// directory whose entries it changed goes into `dirty`, for one
+/// [`sync_dirs`] over a whole batch.
+fn create_dir_all_deferred(path: &Path, dirty: &mut std::collections::BTreeSet<PathBuf>) -> std::io::Result<()> {
+    let mut at = path;
+    while !at.exists() {
+        let Some(parent) = at.parent().filter(|p| !p.as_os_str().is_empty()) else { break };
+        dirty.insert(parent.to_path_buf());
+        at = parent;
+    }
+    std::fs::create_dir_all(path)
+}
+
 /// Flushes a file's data and metadata to the device, as
 /// [`std::fs::File::sync_all`] does, on any filesystem a DJ stick uses.
 ///
@@ -527,6 +579,7 @@ impl Publication {
         let moves = Self::moves(self.stage.path())?;
         let mut entries = Vec::with_capacity(paths.len());
         let mut directories = std::collections::BTreeSet::new();
+        let mut images = Vec::new();
         for path in paths {
             // macOS creates AppleDouble companions on removable filesystems.
             // They are metadata, not part of the exported library, and can
@@ -538,11 +591,7 @@ impl Publication {
             let image_present = image.try_exists()?;
             let present = image_present || moves.contains_key(path);
             if image_present {
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&image)
-                    .and_then(|file| flush(&file))
-                    .map_err(at("flush", &image))?;
+                images.push(image.clone());
             }
             let target = self.root.join(path);
             let had_target = target.try_exists()? && std::fs::metadata(&target)?.is_file();
@@ -560,10 +609,17 @@ impl Publication {
                 parent = dir.parent();
             }
         }
-        // Flush each directory once, children before parents.
-        for directory in directories.iter().rev() {
-            sync_dir(directory)?;
-        }
+        // Every image and every directory holding one is on the device
+        // before the record that names them is: one flush each, several at
+        // a time, all finished before the record is written.
+        in_parallel(&images, |image| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(image)
+                .and_then(|file| flush(&file))
+                .map_err(at("flush", image))
+        })?;
+        sync_dirs(directories.iter().map(PathBuf::as_path))?;
         write(
             &self.stage.path().join("publication.json"),
             &serde_json::to_vec(&entries)?,
@@ -745,129 +801,177 @@ impl Publication {
         // audio file is published with atomic renames instead of being copied
         // over the USB a second time. Every intermediate state is recognizable
         // and recovery always rolls forward.
-        let publish = |entry: &PublicationEntry| -> std::io::Result<()> {
+        //
+        // It runs in two passes, each flushing every directory it changed
+        // once rather than after every file (a first export publishes
+        // thousands of analysis and artwork files, and a flush per file was
+        // most of its time on a USB stick). First every file this replaces
+        // or removes is set aside into the journal; then every new image is
+        // moved into place. Each pass creates the folders it needs and makes
+        // them durable before moving anything into them, and the journal is
+        // retired only once both passes are. So a file is always set aside
+        // durably before its replacement lands, as before, and an
+        // interruption leaves each entry not started, set aside, or
+        // published: the states the roll-forward below already recognizes.
+        let same_root = || -> std::io::Result<()> {
             if root_handle != same_file::Handle::from_path(root)? {
                 return Err(std::io::Error::other("Destination volume changed during publication"));
             }
-            let image = journal.join(&entry.path);
-            let target = root.join(&entry.path);
-            if let Some(from) = moves.get(&entry.path) {
-                let source = root.join(from);
-                if source.try_exists()? && !target.try_exists()? {
-                    if let Some(parent) = target.parent() { create_dir_all(parent)?; }
-                    rename(&source, &target)?;
-                    sync_dir(source.parent().unwrap_or(root))?;
-                    sync_dir(target.parent().unwrap_or(root))?;
-                } else if source.try_exists()? || !target.try_exists()? {
-                    return Err(std::io::Error::other("Relocated audio is ambiguous; recovery data retained"));
-                }
-                return Ok(());
+            Ok(())
+        };
+        // Every failure names the file it was publishing.
+        let named = |entry: &PublicationEntry, error: std::io::Error| -> std::io::Error {
+            if error.to_string().contains(&*entry.path.to_string_lossy()) {
+                error
+            } else {
+                std::io::Error::new(error.kind(), format!("Could not publish {}: {error}", entry.path.display()))
             }
-            let previous = journal.join(".previous").join(&entry.path);
-            if is_appledouble(&entry.path) {
-                // Older journals included these transient files. Preserve an
-                // existing target; if it was moved aside before a crash,
-                // restore it. Never let a sidecar block real library recovery.
-                if !target.try_exists()? && previous.try_exists()? {
-                    if let Some(parent) = target.parent() {
-                        create_dir_all(parent)?;
-                    }
-                    rename(&previous, &target).map_err(at("restore", &target))?;
-                    sync_dir(target.parent().unwrap_or(root))?;
-                }
-                return Ok(());
-            }
-            if entry.present {
-                if image.try_exists()? {
-                    if entry.had_target == Some(true)
-                        && !target.try_exists()?
-                        && !previous.try_exists()?
-                    {
-                        return Err(std::io::Error::other(format!(
-                            "Publication target vanished at {}; recovery data was retained",
-                            entry.path.display()
-                        )));
-                    }
-                    if target.try_exists()? {
-                        if target.is_dir() {
-                            return Err(std::io::Error::other(format!(
-                                "Publication target is a directory: {}",
-                                entry.path.display()
-                            )));
-                        }
-                        if previous.try_exists()? {
-                            return Err(std::io::Error::other(format!(
-                                "Publication conflict at {}; recovery data was retained",
-                                entry.path.display()
-                            )));
-                        }
-                        if entry.had_target == Some(false) {
-                            return Err(std::io::Error::other(format!(
-                                "Publication target appeared at {}; recovery data was retained",
-                                entry.path.display()
-                            )));
-                        }
-                        if let Some(parent) = previous.parent() {
-                            create_dir_all(parent)?;
-                        }
-                        rename(&target, &previous).map_err(at("set aside the previous", &target))?;
+        };
+
+        // Pass 1: check every entry and set aside what it replaces.
+        let mut created = std::collections::BTreeSet::new();
+        let mut set_aside: Vec<(&PublicationEntry, PathBuf, PathBuf, &'static str)> = Vec::new();
+        for entry in &entries {
+            let plan = (|| -> std::io::Result<()> {
+                same_root()?;
+                let image = journal.join(&entry.path);
+                let target = root.join(&entry.path);
+                if let Some(from) = moves.get(&entry.path) {
+                    let source = root.join(from);
+                    if source.try_exists()? && !target.try_exists()? {
+                        if let Some(parent) = target.parent() { create_dir_all(parent)?; }
+                        rename(&source, &target)?;
+                        sync_dir(source.parent().unwrap_or(root))?;
                         sync_dir(target.parent().unwrap_or(root))?;
+                    } else if source.try_exists()? || !target.try_exists()? {
+                        return Err(std::io::Error::other("Relocated audio is ambiguous; recovery data retained"));
                     }
-                    if let Some(parent) = target.parent() {
-                        create_dir_all(parent).map_err(at("create the folder", parent))?;
-                    }
-                    rename(&image, &target).map_err(at("publish", &target))?;
-                    sync_dir(target.parent().unwrap_or(root))?;
-                } else if !target.try_exists()?
-                    || (entry.had_target == Some(true) && !previous.try_exists()?)
-                {
-                    // A lost new image must never silently become a deletion.
-                    // Mark this journal before restoring the old file, so a
-                    // later recovery cannot mistake that old file for a
-                    // successfully published new image.
-                    write(&incomplete, entry.path.to_string_lossy().as_bytes())?;
-                    if previous.try_exists()? && !target.try_exists()? {
+                    return Ok(());
+                }
+                let previous = journal.join(".previous").join(&entry.path);
+                if is_appledouble(&entry.path) {
+                    // Older journals included these transient files. Preserve an
+                    // existing target; if it was moved aside before a crash,
+                    // restore it. Never let a sidecar block real library recovery.
+                    if !target.try_exists()? && previous.try_exists()? {
                         if let Some(parent) = target.parent() {
                             create_dir_all(parent)?;
                         }
-                        copy(&previous, &target)?;
+                        rename(&previous, &target).map_err(at("restore", &target))?;
+                        sync_dir(target.parent().unwrap_or(root))?;
                     }
-                    return Err(std::io::Error::other(format!(
-                        "Missing publication image {}; the previous file was restored",
-                        entry.path.display()
-                    )));
+                    return Ok(());
                 }
-            } else if target.try_exists()? {
-                if entry.had_target == Some(false) {
-                    return Err(std::io::Error::other(format!(
-                        "Publication target appeared at {}; recovery data was retained",
-                        entry.path.display()
-                    )));
+                if entry.present {
+                    if image.try_exists()? {
+                        if entry.had_target == Some(true)
+                            && !target.try_exists()?
+                            && !previous.try_exists()?
+                        {
+                            return Err(std::io::Error::other(format!(
+                                "Publication target vanished at {}; recovery data was retained",
+                                entry.path.display()
+                            )));
+                        }
+                        if target.try_exists()? {
+                            if target.is_dir() {
+                                return Err(std::io::Error::other(format!(
+                                    "Publication target is a directory: {}",
+                                    entry.path.display()
+                                )));
+                            }
+                            if previous.try_exists()? {
+                                return Err(std::io::Error::other(format!(
+                                    "Publication conflict at {}; recovery data was retained",
+                                    entry.path.display()
+                                )));
+                            }
+                            if entry.had_target == Some(false) {
+                                return Err(std::io::Error::other(format!(
+                                    "Publication target appeared at {}; recovery data was retained",
+                                    entry.path.display()
+                                )));
+                            }
+                            if let Some(parent) = previous.parent() {
+                                create_dir_all_deferred(parent, &mut created)?;
+                            }
+                            set_aside.push((entry, target, previous, "set aside the previous"));
+                        }
+                    } else if !target.try_exists()?
+                        || (entry.had_target == Some(true) && !previous.try_exists()?)
+                    {
+                        // A lost new image must never silently become a deletion.
+                        // Mark this journal before restoring the old file, so a
+                        // later recovery cannot mistake that old file for a
+                        // successfully published new image.
+                        write(&incomplete, entry.path.to_string_lossy().as_bytes())?;
+                        if previous.try_exists()? && !target.try_exists()? {
+                            if let Some(parent) = target.parent() {
+                                create_dir_all(parent)?;
+                            }
+                            copy(&previous, &target)?;
+                        }
+                        return Err(std::io::Error::other(format!(
+                            "Missing publication image {}; the previous file was restored",
+                            entry.path.display()
+                        )));
+                    }
+                } else if target.try_exists()? {
+                    if entry.had_target == Some(false) {
+                        return Err(std::io::Error::other(format!(
+                            "Publication target appeared at {}; recovery data was retained",
+                            entry.path.display()
+                        )));
+                    }
+                    if previous.try_exists()? {
+                        return Err(std::io::Error::other(format!(
+                            "Publication conflict at {}; recovery data was retained",
+                            entry.path.display()
+                        )));
+                    }
+                    if let Some(parent) = previous.parent() {
+                        create_dir_all_deferred(parent, &mut created)?;
+                    }
+                    set_aside.push((entry, target, previous, "remove"));
                 }
-                if previous.try_exists()? {
-                    return Err(std::io::Error::other(format!(
-                        "Publication conflict at {}; recovery data was retained",
-                        entry.path.display()
-                    )));
-                }
-                if let Some(parent) = previous.parent() {
-                    create_dir_all(parent)?;
-                }
-                rename(&target, &previous).map_err(at("remove", &target))?;
-                sync_dir(target.parent().unwrap_or(root))?;
-            }
-            Ok(())
-        };
-        for entry in &entries {
-            publish(entry).map_err(|error| {
-                // Every failure names the file it was publishing.
-                if error.to_string().contains(&*entry.path.to_string_lossy()) {
-                    error
-                } else {
-                    std::io::Error::new(error.kind(), format!("Could not publish {}: {error}", entry.path.display()))
-                }
-            })?;
+                Ok(())
+            })();
+            plan.map_err(|error| named(entry, error))?;
         }
+        sync_dirs(created.iter().map(PathBuf::as_path))?;
+        let mut changed = std::collections::BTreeSet::new();
+        for (entry, target, previous, action) in &set_aside {
+            same_root().map_err(|error| named(entry, error))?;
+            rename(target, previous).map_err(at(action, target)).map_err(|error| named(entry, error))?;
+            changed.insert(target.parent().unwrap_or(root).to_path_buf());
+            changed.insert(previous.parent().unwrap_or(root).to_path_buf());
+        }
+        sync_dirs(changed.iter().map(PathBuf::as_path))?;
+
+        // Pass 2: move every new image into place.
+        let mut created = std::collections::BTreeSet::new();
+        let mut placed = Vec::new();
+        for entry in entries.iter().filter(|e| e.present && !moves.contains_key(&e.path) && !is_appledouble(&e.path)) {
+            let image = journal.join(&entry.path);
+            if !image.try_exists().map_err(|error| named(entry, error))? {
+                continue;
+            }
+            let target = root.join(&entry.path);
+            if let Some(parent) = target.parent() {
+                create_dir_all_deferred(parent, &mut created)
+                    .map_err(at("create the folder", parent))
+                    .map_err(|error| named(entry, error))?;
+            }
+            placed.push((entry, image, target));
+        }
+        sync_dirs(created.iter().map(PathBuf::as_path))?;
+        let mut changed = std::collections::BTreeSet::new();
+        for (entry, image, target) in &placed {
+            same_root().map_err(|error| named(entry, error))?;
+            rename(image, target).map_err(at("publish", target)).map_err(|error| named(entry, error))?;
+            changed.insert(target.parent().unwrap_or(root).to_path_buf());
+        }
+        sync_dirs(changed.iter().map(PathBuf::as_path))?;
         if journal.join(".verification-required").try_exists()? { return Ok(()); }
         Self::retire(root, journal)
     }
@@ -1155,7 +1259,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         write(&root.path().join("first"), b"old").unwrap();
         write(&root.path().join("obsolete"), b"old").unwrap();
-        // Force failure after publishing the first file.
+        // Force a failure on the second file. Every entry is checked before
+        // anything moves, so the first is not published either.
         std::fs::create_dir(root.path().join("second")).unwrap();
         let publication = Publication::new(root.path(), ".journal").unwrap();
         write(&publication.stage().join("first"), b"new first").unwrap();
@@ -1164,12 +1269,10 @@ mod tests {
             .commit(&["first".into(), "second".into(), "obsolete".into()])
             .is_err());
         drop(publication);
-        assert_eq!(
-            std::fs::read(root.path().join("first")).unwrap(),
-            b"new first"
-        );
+        assert_eq!(std::fs::read(root.path().join("first")).unwrap(), b"old");
         assert!(Publication::recover(root.path(), ".journal").is_err());
-        assert!(root.path().join(".journal/.previous/first").is_file());
+        assert!(root.path().join(".journal/first").is_file());
+        assert_eq!(std::fs::read(root.path().join("first")).unwrap(), b"old");
         std::fs::remove_dir(root.path().join("second")).unwrap();
         Publication::recover(root.path(), ".journal").unwrap();
         Publication::recover(root.path(), ".journal").unwrap();
